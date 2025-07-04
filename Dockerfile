@@ -1,5 +1,5 @@
 # Use Ubuntu 22.04 as base image
-FROM ultralytics/ultralytics:latest
+FROM ultralytics/ultralytics:8.3.130
 
 # Set environment variables to avoid interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive \

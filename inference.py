@@ -31,7 +31,7 @@ class TemporalFilter:
 
 # This class is needed to pass the parameters between processes because the original types cannot be pickled
 class Parameters:
-    def __init__(self, _depth_intrinsics, _extrinsic):
+    def __init__(self, _depth_intrinsics, _extrinsic, _color_width, _color_height):
         self.fx = _depth_intrinsics.fx
         self.fy = _depth_intrinsics.fy
         self.cx = _depth_intrinsics.cx
@@ -40,6 +40,8 @@ class Parameters:
         self.height = _depth_intrinsics.height
         self.rot = _extrinsic.rot
         self.transform = _extrinsic.transform
+        self.color_width = _color_width
+        self.color_height = _color_height
 
 
 def get_frame_data(color_frame, depth_frame):
@@ -122,16 +124,12 @@ def read_camera(*, frame_queue, stream_queue, parameters_queue,  width, height, 
 
         if not _initialized: 
             _color_width, _color_height, _depth_width, _depth_height, _color_intrinsics, _color_distortion, _depth_intrinsics, _depth_distortion, _extrinsic = get_frame_data(color_frame, depth_frame)
-            parameters_queue.put(Parameters(_depth_intrinsics, _extrinsic))
+            parameters_queue.put(Parameters(_depth_intrinsics, _extrinsic, _color_width, _color_height))
                 
         # the depth frame has lower resolution than the color frame, so we need to resize it
         # to match the size of the color frame. We use the nearest neighbor interpolation
         # to avoid creating new data points (which could lead to incorrect depth values)
-        depth_data = cv2.resize(
-            np.frombuffer(depth_frame.get_data(), dtype=np.uint16).reshape(_depth_height, _depth_width),
-            (_color_width, _color_height),
-            interpolation=cv2.INTER_NEAREST
-        )
+        depth_data = np.frombuffer(depth_frame.get_data(), dtype=np.uint16).reshape(_depth_height, _depth_width)
         
         depth_data = depth_data.astype(np.float32) * depth_frame.get_depth_scale()
         depth_data = np.where((depth_data > MIN_DEPTH) & (depth_data < MAX_DEPTH), depth_data, 0)
@@ -185,13 +183,20 @@ def inference(*, model, frame_queue, parameters_queue, send_queue, min_confidenc
             depth_intrinsics.height = parameters.height
             extrinsic.rot = parameters.rot
             extrinsic.transform = parameters.transform
+            color_width = parameters.color_width
+            color_height = parameters.color_height
 
+        if color_height*color_width == 0:
+            continue
+
+        coeff_height = depth_intrinsics.height / color_height
+        coeff_width = depth_intrinsics.width / color_width
 
         if verbose: print("[INFERENCE] Inference on image of size", image.size)
 
         results = model.predict(image, stream=True, conf=min_confidence, show=True, verbose=False)
         
-        message = parse(results, depth, depth_intrinsics, extrinsic)
+        message = parse(results, depth, depth_intrinsics, extrinsic, coeff_height, coeff_width)
 
         if len(message) > 0:
             send_queue.put(message)
@@ -201,7 +206,7 @@ def inference(*, model, frame_queue, parameters_queue, send_queue, min_confidenc
 
     cv2.destroyAllWindows()
 
-def parse(results,depth, depth_intrinsics, extrinsic):    
+def parse(results,depth, depth_intrinsics, extrinsic, coeff_height, coeff_width):    
     message = []
 
     for result in results:
@@ -211,12 +216,12 @@ def parse(results,depth, depth_intrinsics, extrinsic):
         for object_res in result_json:
             if object_res["name"] == "Talea":
                 keypoints = object_res["keypoints"]
-                t_bottom_x = keypoints["x"][0]
-                t_bottom_y = keypoints["y"][0]
-                t_top_x = keypoints["x"][1]
-                t_top_y = keypoints["y"][1]
-                t_middle_x = keypoints["x"][2]
-                t_middle_y = keypoints["y"][2]
+                t_bottom_x = keypoints["x"][0]*coeff_width
+                t_bottom_y = keypoints["y"][0]*coeff_height
+                t_top_x = keypoints["x"][1]*coeff_width
+                t_top_y = keypoints["y"][1]*coeff_height
+                t_middle_x = keypoints["x"][2]*coeff_width
+                t_middle_y = keypoints["y"][2]*coeff_height
 
                 t_bottom_z = 0
                 t_top_z = 0

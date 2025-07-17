@@ -16,6 +16,11 @@ _initialized = False
 MIN_DEPTH = 20  # 20mm
 MAX_DEPTH = 10000  # 10000mm
 
+CROP_WIDTH = 600
+CROP_HEIGHT = 400
+CROP_STARTING_ROW = 0
+CROP_STARTING_COL = 340
+
 class TemporalFilter:
     def __init__(self, alpha):
         self.alpha = alpha
@@ -28,6 +33,20 @@ class TemporalFilter:
             result = cv2.addWeighted(frame, self.alpha, self.previous_frame, 1 - self.alpha, 0)
         self.previous_frame = result
         return result
+
+class ImageCropper:
+    def __init__(self, width, height, starting_row, starting_col):
+        self.width = width
+        self.height = height
+        self.starting_row = starting_row
+        self.starting_col = starting_col
+
+    def crop(self, image):
+        end_row, end_col = self.starting_row + self.height, self.starting_col + self.width
+        return image[self.starting_row:end_row, self.starting_col:end_col, :]
+    
+    def cropped2orig(self, row, col):
+        return row + self.starting_row, col + self.starting_col
 
 # This class is needed to pass the parameters between processes because the original types cannot be pickled
 class Parameters:
@@ -77,10 +96,10 @@ def get_frame_data(color_frame, depth_frame):
 def transform_points(x, y, depth, depth_intrinsics, extrinsic):
     res = pyorbbecsdk.transformation2dto3d(pyorbbecsdk.OBPoint2f(x, y), depth, depth_intrinsics, extrinsic)
     original_point = (x , y , depth)
-    print(f"\n--- Point Transformation ---")
-    print(f"Original point: {original_point}")
-    print("Transformed point:",res)
-    print(f"--------------------------------------------")
+    # print(f"\n--- Point Transformation ---")
+    # print(f"Original point: {original_point}")
+    # print("Transformed point:",res)
+    # print(f"--------------------------------------------")
     return res.z, res.x, res.y
 
 def read_camera(*, frame_queue, stream_queue, parameters_queue,  width, height, verbose=False):
@@ -95,6 +114,10 @@ def read_camera(*, frame_queue, stream_queue, parameters_queue,  width, height, 
             profile_list = pipeline.get_stream_profile_list(sensor_type)
             assert profile_list is not None
             profile = profile_list.get_default_video_stream_profile()
+            for profile_iterator in profile_list:
+                if profile_iterator.get_width() == width and profile_iterator.get_height() == height:
+                    profile = profile_iterator
+                    break
             assert profile is not None
             print(f"{sensor_type} profile:", profile)
             config.enable_stream(profile)  # Enable the stream for the sensor
@@ -193,6 +216,10 @@ def inference(*, model, frame_queue, parameters_queue, send_queue, min_confidenc
         coeff_width = depth_intrinsics.width / color_width
 
         if verbose: print("[INFERENCE] Inference on image of size", image.size)
+        
+
+        cropper = ImageCropper(CROP_WIDTH, CROP_HEIGHT, CROP_STARTING_ROW, CROP_STARTING_COL)
+        image = cropper.crop(image)
 
         results = model.predict(image, stream=True, conf=min_confidence, show=True, verbose=False)
         
@@ -212,10 +239,17 @@ def parse(results,depth, depth_intrinsics, extrinsic, coeff_height, coeff_width)
     for result in results:
         i = 0
         result_json = json.loads(result.to_json())
-                
+
+        cropper = ImageCropper(CROP_WIDTH, CROP_HEIGHT, CROP_STARTING_ROW, CROP_STARTING_COL)
+
         for object_res in result_json:
             if object_res["name"] == "Talea":
                 keypoints = object_res["keypoints"]
+                
+                keypoints["y"][0], keypoints["x"][0] = cropper.cropped2orig(keypoints["y"][0], keypoints["x"][0])
+                keypoints["y"][1], keypoints["x"][1] = cropper.cropped2orig(keypoints["y"][1], keypoints["x"][1])
+                keypoints["y"][2], keypoints["x"][2] = cropper.cropped2orig(keypoints["y"][2], keypoints["x"][2])
+
                 t_bottom_x = keypoints["x"][0]*coeff_width
                 t_bottom_y = keypoints["y"][0]*coeff_height
                 t_top_x = keypoints["x"][1]*coeff_width

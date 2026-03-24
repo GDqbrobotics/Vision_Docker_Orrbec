@@ -1,3 +1,5 @@
 *.jpg
 *.wav
 .vscode
+__pycache__
+Log

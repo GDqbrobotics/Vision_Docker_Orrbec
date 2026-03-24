@@ -10,14 +10,15 @@ from PIL import ImageOps
 from ultralytics import YOLO
 from typing import Union, Any, Optional
 from pyorbbecsdk import *
+import matplotlib.pyplot as plt
 
 _initialized = False
 
 MIN_DEPTH = 20  # 20mm
 MAX_DEPTH = 10000  # 10000mm
 
-CROP_WIDTH = 700
-CROP_HEIGHT = 700
+CROP_WIDTH = 900
+CROP_HEIGHT = 900
 CROP_STARTING_ROW = int((1080 - int(CROP_HEIGHT))/2)
 CROP_STARTING_COL = int((1920 - int(CROP_WIDTH))/2)
 
@@ -140,7 +141,7 @@ def read_camera(*, frame_queue, parameters_queue,  width, height, verbose=False)
     pipeline = Pipeline()
     temporal_filter = TemporalFilter(alpha=0.5)
     config = Config()  # Initialize the config for the pipeline
-    
+    align_filter = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)    
     try:
         # Enable depth and color sensors
         for sensor_type in [OBSensorType.DEPTH_SENSOR, OBSensorType.COLOR_SENSOR]:
@@ -167,10 +168,16 @@ def read_camera(*, frame_queue, parameters_queue,  width, height, verbose=False)
     while True:
         # Wait for frames from the pipeline (with a timeout of 100 ms)
         frames = pipeline.wait_for_frames(100)
-        if frames is None:
+        if not frames:
             continue
 
-        # Get depth and color frames from the captured frames
+        # --- Spatial Alignment ---
+        # Transforms one stream to the coordinate system/FOV of the other
+        frames = align_filter.process(frames)
+        if not frames:
+            continue
+        
+        frames = frames.as_frame_set()
         depth_frame = frames.get_depth_frame()
         color_frame = frames.get_color_frame()
 
@@ -262,78 +269,178 @@ def inference(*, model, frame_queue, parameters_queue, send_queue, min_confidenc
         for i, r in enumerate(results):
             # Save results to disk
             r.save(filename=f"result.jpg")
-
-        # message = parse(results, depth, depth_intrinsics, extrinsic, coeff_height, coeff_width)
-
-        # if len(message) > 0:
-        #     send_queue.put(message)
+        closure_factor = None
+        box = []
+        
+        closure_factor, box, wrist, knuckle_ref = process_hand_results(results)
+        message = parse_box(box, depth, depth_intrinsics, extrinsic, coeff_height, coeff_width)
+        
+        if len(message) > 0:
+            message[0]["closure_factor"] = closure_factor
+            send_queue.put(message)
+            print("[INFERENCE] Sent message: ", message)
         
         # if sleep > 0:
         #     time.sleep(sleep)
 
     cv2.destroyAllWindows()
 
-def parse(results,depth, depth_intrinsics, extrinsic, coeff_height, coeff_width):    
-    message = []
-    print(results)
+def process_hand_results(results, verbose=False):
+    closure_factor = None
+    box = []
+    wrist = None
+    knuckle_ref = None
     for result in results:
-        i = 0
-        result_json = json.loads(result.to_json())
-
-        cropper = ImageCropper(CROP_WIDTH, CROP_HEIGHT, CROP_STARTING_ROW, CROP_STARTING_COL)
-
-
-        for object_res in result_json:
-            print("Object detected:", object_res["name"], "with confidence", object_res["confidence"])
-            if object_res["name"] == "Talea":
-                keypoints = object_res["keypoints"]
-                
-                keypoints["y"][0], keypoints["x"][0] = cropper.cropped2orig(keypoints["y"][0], keypoints["x"][0])
-                keypoints["y"][1], keypoints["x"][1] = cropper.cropped2orig(keypoints["y"][1], keypoints["x"][1])
-                keypoints["y"][2], keypoints["x"][2] = cropper.cropped2orig(keypoints["y"][2], keypoints["x"][2])
-
-                t_bottom_x = keypoints["x"][0]*coeff_width
-                t_bottom_y = keypoints["y"][0]*coeff_height
-                t_top_x = keypoints["x"][1]*coeff_width
-                t_top_y = keypoints["y"][1]*coeff_height
-                t_middle_x = keypoints["x"][2]*coeff_width
-                t_middle_y = keypoints["y"][2]*coeff_height
-
-                t_bottom_z = 0
-                t_top_z = 0
-                t_middle_z = 0
-
-                try:
-                    t_bottom_z = depth[int(t_bottom_y), int(t_bottom_x)].item()
-                    t_top_z = depth[int(t_top_y), int(t_top_x)].item()
-                    t_middle_z = depth[int(t_middle_y), int(t_middle_x)].item()
-                except Exception as e:
-                    print(e)
-                    continue
-                
-                if t_bottom_z == 0 or t_top_z == 0 or t_middle_z == 0:
-                    continue
-
-                bottom_z, bottom_x, bottom_y = transform_points(t_bottom_x, t_bottom_y, t_bottom_z, depth_intrinsics, extrinsic)
-                top_z, top_x, top_y = transform_points(t_top_x, t_top_y, t_top_z, depth_intrinsics, extrinsic)
-                middle_z, middle_x, middle_y = transform_points(t_middle_x, t_middle_y, t_middle_z, depth_intrinsics, extrinsic)
-
-                if t_bottom_z*t_top_z*t_middle_z != 0: #check for possible occlusion on the depth image
-                    message.append({
-                        "Talea number": i,
-                        "X_bottom": bottom_x,
-                        "Y_bottom": bottom_y,
-                        "Z_bottom": bottom_z,
-                        "X_top": top_x,
-                        "Y_top": top_y,
-                        "Z_top": top_z,
-                        "X_middle": middle_x,
-                        "Y_middle": middle_y,
-                        "Z_middle": middle_z,
-                        "confidence": object_res["confidence"]
-                    })
+        # 1. Get Bounding Boxes in original pixel coordinates (xyxy)
+        # boxes.xyxy returns [xmin, ymin, xmax, ymax]
+        boxes = result.boxes.xyxy.cpu().numpy()
+        if len(boxes) != 1:
+            continue
+        # 2. Get Keypoints (assuming 21 hand keypoints standard)
+        # keypoints.xy returns [N, 21, 2]
+        if result.keypoints is not None:
+            kpts_all = result.keypoints.xy.cpu().numpy()
             
-            i += 1
+            for i, box in enumerate(boxes):
+                if verbose: print(f"Hand {i} Bounding Box (px): {box}")
+                
+                # Get keypoints for this specific hand
+                kpts = kpts_all[i] 
+                
+                # Hand Closure Logic:
+                # Keypoint indices (standard MediaPipe/YOLO hand format):
+                # 0: Wrist, 4: Thumb tip, 8: Index tip, 12: Middle tip, 16: Ring tip, 20: Pinky tip
+                # 9: Middle finger knuckle (MCP) - used as a reference for hand scale
+                
+                wrist = kpts[0]
+                fingertips = [kpts[8], kpts[12], kpts[16], kpts[20]] # Index, Middle, Ring, Pinky
+                knuckle_ref = kpts[9] # Middle finger knuckle
+                
+                # Calculate reference length (Wrist to Middle Knuckle) to handle zoom/distance
+                hand_scale = np.linalg.norm(wrist - knuckle_ref)
+                
+                if hand_scale == 0: continue # Avoid division by zero
+                
+                # Calculate average distance of fingers to wrist
+                # When open, tips are far from wrist. When closed (fist), tips are near knuckles/wrist.
+                distances = [np.linalg.norm(tip - wrist) for tip in fingertips]
+                avg_dist = np.mean(distances)
+                
+                # Normalized factor calculation:
+                # A common heuristic: 
+                # Fully open: avg_dist is ~2.5x the hand_scale
+                # Fully closed: avg_dist is ~1.0x the hand_scale
+                # We map this to 0 (open) to 1 (closed)
+                closure_raw = (2.5 - (avg_dist / hand_scale)) / 1.5
+                closure_factor = np.clip((closure_raw-0.9)*8, 0, 1)
+                
+                if verbose: print(f"Hand {i} Closure Factor: {closure_factor:.2f} (1.0 = Fist, 0.0 = Open)")
+    return closure_factor, box, wrist, knuckle_ref
+
+def parse(wrist, knuckle_ref, depth, depth_intrinsics, extrinsic, coeff_height, coeff_width):
+    message = []
+    if wrist is None or knuckle_ref is None:
+        return message
+    print("Wrist:", wrist)
+    print("Knuckle Reference:", knuckle_ref)
+    cropper = ImageCropper(CROP_WIDTH, CROP_HEIGHT, CROP_STARTING_ROW, CROP_STARTING_COL)
+    wrist[1], wrist[0] = cropper.cropped2orig(wrist[1], wrist[0])
+    knuckle_ref[1], knuckle_ref[0] = cropper.cropped2orig(knuckle_ref[1], knuckle_ref[0])
+    wrist[0] = wrist[0] * coeff_width
+    wrist[1] = wrist[1] * coeff_height
+    knuckle_ref[0] = knuckle_ref[0] * coeff_width
+    knuckle_ref[1] = knuckle_ref[1] * coeff_height
+    wrist_depth = depth[int(wrist[0]), int(wrist[1])]
+    knuckle_ref_depth = depth[int(knuckle_ref[0]), int(knuckle_ref[1])]
+    if wrist_depth == 0 or knuckle_ref_depth == 0:
+        print("Invalid depth at wrist or knuckle reference point.")
+        return message
+    
+    knuckle_z, knuckle_x, knuckle_y = transform_points(knuckle_ref[0], knuckle_ref[1], knuckle_ref_depth, depth_intrinsics, extrinsic)
+    wrist_z, wrist_x, wrist_y = transform_points(wrist[0], wrist[1], wrist_depth, depth_intrinsics, extrinsic)
+    message.append({
+        "X_centroid": wrist_x,
+        "Y_centroid": wrist_y,
+        "Z_centroid": wrist_z,
+        "orientation": {
+            "wrist_to_knuckle_x": wrist_x - knuckle_x,
+            "wrist_to_knuckle_y": wrist_y - knuckle_y,
+            "wrist_to_knuckle_z": wrist_z - knuckle_z
+        }
+    })
+    return message
+
+def parse_box(box,depth, depth_intrinsics, extrinsic, coeff_height, coeff_width):    
+    message = []
+    if len(box) != 4:
+        return message
+    
+    cropper = ImageCropper(CROP_WIDTH, CROP_HEIGHT, CROP_STARTING_ROW, CROP_STARTING_COL)
+    box[1], box[0] = cropper.cropped2orig(box[1], box[0])
+    box[3], box[2] = cropper.cropped2orig(box[3],box[2])
+    print(box)
+    target_x_min = int(box[0]*coeff_width)
+    target_y_min = int(box[1]*coeff_height)
+    target_x_max = int(box[2]*coeff_width)
+    target_y_max = int(box[3]*coeff_height)
+    target_z = 0
+
+    try:
+        x_array = range(target_x_min, target_x_max, 1) #width or col
+        y_array = range(target_y_min, target_y_max, 1) #height or row
+        X, Y = np.meshgrid(x_array, y_array)
+        
+        Z = depth[Y, X] # is a matrix so the order is Y,X (row,col) and not X,Y
+        Z_max = np.max(Z) 
+        Z = np.where(Z > 200, Z, Z_max)  # Replace outliers with max
+        # Remove isolated spikes by applying a median filter
+        Z = cv2.medianBlur(Z, 5)  # Kernel size of 5
+        Z = cv2.medianBlur(Z, 5)
+        Z = cv2.medianBlur(Z, 5)
+
+        # Calculate the middle value between the median and the lowest point
+
+        Z_nonzero = Z.flatten()
+        if len(Z_nonzero) == 0:
+            print("No valid depth points found.")
+            return message
+        Z_min = np.min(Z_nonzero)
+        Z_max = np.max(Z_nonzero)
+        middle_value = (Z_max + Z_min) / 2
+
+        # Filter points lower than the middle value
+        mask = Z < middle_value
+        X_filtered = X[mask]
+        Y_filtered = Y[mask]
+        Z_filtered = Z[mask]
+
+        if len(Z_filtered) == 0:
+            print("No points below the middle value.")
+            return message
+
+        # Calculate the geometric centroid
+        centroid_x = float(np.mean(X_filtered))
+        centroid_y = float(np.mean(Y_filtered))
+        centroid_z = float(np.mean(Z_filtered))
+        
+        final_target_z, final_target_x, final_target_y = transform_points(centroid_x, centroid_y, centroid_z, depth_intrinsics, extrinsic)
+        
+        message.append({
+            "X_centroid": final_target_x,
+            "Y_centroid": final_target_y,
+            "Z_centroid": final_target_z,
+        })
+
+        if False:
+            fig = plt.figure()
+            ax = plt.axes(projection='3d')
+            ax.scatter3D(X,Y,Z, c=Z, cmap='viridis')
+            # ax.scatter3D(X_filtered,Y_filtered,Z_filtered, c=Z_filtered, cmap='viridis')
+            plt.show()
+
+    except Exception as e:
+        print(e)
+        return message
 
     return message
 

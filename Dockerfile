@@ -50,7 +50,7 @@ RUN pybind11-stubgen pyorbbecsdk
 RUN python3 setup.py bdist_wheel
 
 # Install udev rules
-RUN bash ./scripts/install_udev_rules.sh && \
+RUN bash ./scripts/env_setup/install_udev_rules.sh && \
     rm -rf /var/lib/apt/lists/* \
     && pip install paho-mqtt
 

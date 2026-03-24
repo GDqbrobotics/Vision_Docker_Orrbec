@@ -18,7 +18,7 @@ services:
   vision-orbbec:
     build:
       context: .
-      dockerfile: Dockerfile_ollama
+      dockerfile: Dockerfile_jetson
       network: host
     deploy:
       resources:
@@ -43,4 +43,5 @@ services:
       - XAUTHORITY=$XAUTHORITY  # needed to show results on screen
     network_mode: host
     restart: unless-stopped
-    privileged: true
+    privileged: true  
+    command: sleep infinity

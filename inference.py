@@ -16,10 +16,10 @@ _initialized = False
 MIN_DEPTH = 20  # 20mm
 MAX_DEPTH = 10000  # 10000mm
 
-CROP_WIDTH = 600
-CROP_HEIGHT = 400
-CROP_STARTING_ROW = 0
-CROP_STARTING_COL = 340
+CROP_WIDTH = 1280
+CROP_HEIGHT = 800
+CROP_STARTING_ROW = int((1080 - int(CROP_HEIGHT))/2)
+CROP_STARTING_COL = int((1920 - int(CROP_WIDTH))/2)
 
 class TemporalFilter:
     def __init__(self, alpha):
@@ -102,7 +102,7 @@ def transform_points(x, y, depth, depth_intrinsics, extrinsic):
     # print(f"--------------------------------------------")
     return res.z, res.x, res.y
 
-def read_camera(*, frame_queue, stream_queue, parameters_queue,  width, height, verbose=False):
+def read_camera(*, frame_queue, parameters_queue,  width, height, verbose=False):
     # Create a pipeline with default device
     pipeline = pyorbbecsdk.Pipeline()
     temporal_filter = TemporalFilter(alpha=0.5)
@@ -114,10 +114,13 @@ def read_camera(*, frame_queue, stream_queue, parameters_queue,  width, height, 
             profile_list = pipeline.get_stream_profile_list(sensor_type)
             assert profile_list is not None
             profile = profile_list.get_default_video_stream_profile()
-            for profile_iterator in profile_list:
-                if profile_iterator.get_width() == width and profile_iterator.get_height() == height:
-                    profile = profile_iterator
-                    break
+            try:
+                for profile_iterator in profile_list:
+                    if profile_iterator.get_width() == width and profile_iterator.get_height() == height:
+                        profile = profile_iterator
+                        break
+            except Exception as e:
+                print(e)
             assert profile is not None
             print(f"{sensor_type} profile:", profile)
             config.enable_stream(profile)  # Enable the stream for the sensor
@@ -304,23 +307,22 @@ def main():
         default="app/best.pt",
         help="Path to the YOLOv11 model"
     )
-
     parser.add_argument(
-        "--stream-width",
+        "--width",
         type=int,
-        default=1280,
-        help="Width of the stream"
+        default=1920,
+        help="Width of the input image"
     )
     parser.add_argument(
-        "--stream-height",
+        "--height",
         type=int,
-        default=720,
-        help="Height of the stream"
+        default=1080,
+        help="Height of the input image"
     )
     parser.add_argument(
         "--mqtt-host",
         type=str,
-        default="192.168.139.70",
+        default="192.168.1.21",
         help="Host of the MQTT broker"
     )
     parser.add_argument(
@@ -374,17 +376,15 @@ def main():
     args = parser.parse_args()
 
     frame_queue = Queue(maxsize=1)
-    stream_queue = Queue(maxsize=1)
     send_queue = Queue()
     parameters_queue = Queue(maxsize=1)
 
     read_process = Process(
         target=read_camera,
         kwargs=dict(
-            width=args.stream_width,
-            height=args.stream_height,
+            width=args.width,
+            height=args.height,
             frame_queue=frame_queue,
-            stream_queue=stream_queue,
             parameters_queue=parameters_queue,
             verbose=args.verbose,
         )

@@ -9,7 +9,8 @@ services:
       - 8080:8080
     volumes:
       - ./mqtt/mosquitto-config:/mosquitto/config/
-      - ./mqtt/auth:/auth 
+      - ./mqtt/auth:/auth
+    network_mode: host
 
 # By using --device-cgroup-rule flag we grant the docker continer permissions -
 # to the camera and usb endpoints of the machine.
@@ -17,19 +18,21 @@ services:
   vision-orbbec:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile_ollama
+      network: host
     deploy:
       resources:
         reservations:
           devices:
-            - driver: cdi
-              device_ids:
-                - nvidia.com/gpu=all
-              capabilities: [gpu]
+              - driver: nvidia
+                device_ids: ['0']
+                capabilities:
+                    - gpu
+    runtime: nvidia
     ports:
       - 80:3000
     volumes:
-      - .:/ultralytics/pyorbbecsdk/app
+      - .:/app
       - /dev:/dev
       - /tmp/.X11-unix:/tmp/.X11-unix # needed to show results on screen
     device_cgroup_rules:
@@ -38,5 +41,6 @@ services:
     environment:
       - DISPLAY=$DISPLAY  # needed to show results on screen
       - XAUTHORITY=$XAUTHORITY  # needed to show results on screen
-
+    network_mode: host
     restart: unless-stopped
+    privileged: true

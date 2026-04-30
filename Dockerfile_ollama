@@ -1,0 +1,41 @@
+# Use Ubuntu 24.04 as base image
+FROM ubuntu:noble
+
+# Set environment variables to avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    build-essential \
+    cmake \
+    python3-dev \
+    python3-venv \
+    python3-pip \
+    # python3-opencv \
+    libudev-dev \
+    ffmpeg \
+    udev \
+    usbutils \
+    libxcb-xinerama0 \
+    libcanberra-gtk-module \
+    libcanberra-gtk3-module \
+    libportaudio2 \
+    alsa-base \
+    alsa-utils \
+    python3-tk \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --upgrade pip \
+    && /opt/venv/bin/pip install paho-mqtt ollama pyorbbecsdk2 sounddevice wavio scipy vosk pillow opencv-python matplotlib typing \
+    && SITE_PACKAGES=$(/opt/venv/bin/python -c "import importlib, os; m=importlib.import_module('pyorbbecsdk'); print(os.path.dirname(m.__file__))") \
+    && [ -f "$SITE_PACKAGES/shared/install_udev_rules.sh" ] && chmod +x "$SITE_PACKAGES/shared/install_udev_rules.sh" || echo "udev install script not found" \
+    && [ -f "$SITE_PACKAGES/shared/install_udev_rules.sh" ] && "$SITE_PACKAGES/shared/install_udev_rules.sh" || true \
+    && (udevadm control --reload-rules && udevadm trigger) || true \
+    && [ -f "$SITE_PACKAGES/examples/requirements.txt" ] && /opt/venv/bin/python -m pip install -r "$SITE_PACKAGES/examples/requirements.txt" || true
+    
+ENV PATH="/opt/venv/bin:$PATH"
+
+CMD ["python3", "app/inference_ollama.py"]

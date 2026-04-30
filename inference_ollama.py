@@ -2,68 +2,122 @@ import argparse
 import numpy as np
 import cv2
 import time
-import json
+import re, json
 import paho.mqtt.client as mqtt
 from multiprocessing import Process, Queue
 from PIL import Image
 from PIL import ImageOps
-# from ultralytics import YOLO
-import pyorbbecsdk
-from examples.utils import frame_to_bgr_image
+from pyorbbecsdk import *
 from ollama import chat 
 import sounddevice as sd
 from scipy.io.wavfile import write
-import wavio as wv
-from vosk import Model, KaldiRecognizer, SetLogLevel
+import matplotlib.pyplot as plt
+from mpl_toolkits import mplot3d
+from typing import Union, Any, Optional
 
 _initialized = False
 
 MIN_DEPTH = 20  # 20mm
 MAX_DEPTH = 10000  # 10000mm
 
-CROP_WIDTH = 1000
-CROP_HEIGHT = 1000
-CROP_STARTING_ROW = int((1080 - int(CROP_HEIGHT))/2)
-CROP_STARTING_COL = int((1920 - int(CROP_WIDTH))/2)
+CROP_WIDTH = 450
+CROP_HEIGHT = 450
+CROP_STARTING_ROW = int((720 - int(CROP_HEIGHT))/2)
+CROP_STARTING_COL = int((1280 - int(CROP_WIDTH))/2)
 
+def frame_to_bgr_image(frame: VideoFrame) -> Union[Optional[np.array], Any]:
+    width = frame.get_width()
+    height = frame.get_height()
+    color_format = frame.get_format()
+    data = np.asanyarray(frame.get_data())
+    image = np.zeros((height, width, 3), dtype=np.uint8)
+    if color_format == OBFormat.RGB:
+        image = np.resize(data, (height, width, 3))
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    elif color_format == OBFormat.BGR:
+        image = np.resize(data, (height, width, 3))
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    elif color_format == OBFormat.YUYV:
+        image = np.resize(data, (height, width, 2))
+        image = cv2.cvtColor(image, cv2.COLOR_YUV2BGR_YUYV)
+    elif color_format == OBFormat.MJPG:
+        image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    elif color_format == OBFormat.I420:
+        image = i420_to_bgr(data, width, height)
+        return image
+    elif color_format == OBFormat.NV12:
+        image = nv12_to_bgr(data, width, height)
+        return image
+    elif color_format == OBFormat.NV21:
+        image = nv21_to_bgr(data, width, height)
+        return image
+    elif color_format == OBFormat.UYVY:
+        image = np.resize(data, (height, width, 2))
+        image = cv2.cvtColor(image, cv2.COLOR_YUV2BGR_UYVY)
+    else:
+        print("Unsupported color format: {}".format(color_format))
+        return None
+    return image
 
 def record_audio(prompt_queue):
     # Sampling frequency
-    freq = 44100
+    freq = 48000
 
     # Recording duration
-    duration = 6
+    duration = 4
 
-    sd.default.device = [24,24]
+    
     device_list=sd.query_devices()
     print(device_list)
-
-    model = Model(lang="en-us")
-
-    # You can also init model by name or with a folder path
-    # model = Model(model_name="vosk-model-en-us-0.21")
-    # model = Model("models/en")
-
-    rec = KaldiRecognizer(model, freq)
-    rec.SetWords(True)
-    rec.SetPartialWords    
+    device_ID = 0
+    for device in device_list:
+        if device["name"].find("Device: Audio") > -1:
+            print("Microphone found.")
+            sd.default.device = device["name"]
+            break
     
+    print(f"Microphone ID:  {sd.default.device}")
+
     while True:
+        pre_recording = sd.rec(int(0.5 * freq), samplerate=freq, channels=1)
+        sd.wait()
+        audio_peak = max(pre_recording)
+        # print(audio_peak)
+        if audio_peak < 0.9: #treashold for audio 
+            continue
         print("Start recording")
         # Start recorder with the given values 
         # of duration and sample frequency
-        recording = sd.rec(int(duration * freq), dtype="int16", samplerate=freq, channels=1)
+        recording = sd.rec(int(duration * freq), samplerate=freq, channels=1)
 
         # Record audio for the given number of seconds
         sd.wait()
         print("Stop recording")
+        
+        # This will convert the NumPy array to an audio
+        # file with the given sampling frequency
+        write("app/recording0.wav", freq, recording)
 
-        data = bytes(recording)
-
-        if rec.AcceptWaveform(data):
-            result_json = json.loads(rec.Result())
-            print(result_json)
-            prompt_queue.put(result_json["text"])
+        response = chat(
+            model='gemma4',
+            messages=[
+                {
+                    'role': 'system',
+                    'content': f'You are a trascription system. You are able to transcript only English or Italian.'
+                },
+                {
+                'images': ["app/recording0.wav"],
+                'role': 'user',
+                'content': 'Answer only with the audio trascription',
+                }
+            ],
+            think=False,
+            stream=False,
+        )
+        sentence = response.message.content
+        print(sentence)
+        if len(sentence) > 10:
+            prompt_queue.put(sentence)
 
 
 class TemporalFilter:
@@ -139,8 +193,20 @@ def get_frame_data(color_frame, depth_frame):
 
 
 def transform_points(x, y, depth, depth_intrinsics, extrinsic):
-    res = pyorbbecsdk.transformation2dto3d(pyorbbecsdk.OBPoint2f(x, y), depth, depth_intrinsics, extrinsic)
-    original_point = (x , y , depth)
+    # x axis is frame width and y axis is height
+    res = transformation2dto3d(OBPoint2f(x, y), depth, depth_intrinsics, extrinsic)
+    
+    print(f"Res Z = {res.z}")
+    #take the highest point in a radius intorn
+    radius = 200
+    for x_i in range(int(x)-radius,int(x)+radius,1):
+        for y_i in range(int(y)-radius,int(y)+radius,1):
+            res_i = transformation2dto3d(OBPoint2f(x_i, y_i), depth, depth_intrinsics, extrinsic)
+            if res_i.z < res.z and res_i.z != 0:
+                res.z = res_i.z 
+    print(f"Filtered Res Z {res.z}")
+    
+    # original_point = (x , y , depth)
     # print(f"\n--- Point Transformation ---")
     # print(f"Original point: {original_point}")
     # print("Transformed point:",res)
@@ -149,13 +215,13 @@ def transform_points(x, y, depth, depth_intrinsics, extrinsic):
 
 def read_camera(*, frame_queue, parameters_queue,  width, height, verbose=False):
     # Create a pipeline with default device
-    pipeline = pyorbbecsdk.Pipeline()
+    pipeline = Pipeline()
     temporal_filter = TemporalFilter(alpha=0.5)
-    config = pyorbbecsdk.Config()  # Initialize the config for the pipeline
-    
+    config = Config()  # Initialize the config for the pipeline
+    align_filter = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
     try:
         # Enable depth and color sensors
-        for sensor_type in [pyorbbecsdk.OBSensorType.DEPTH_SENSOR, pyorbbecsdk.OBSensorType.COLOR_SENSOR]:
+        for sensor_type in [OBSensorType.DEPTH_SENSOR, OBSensorType.COLOR_SENSOR]:
             profile_list = pipeline.get_stream_profile_list(sensor_type)
             assert profile_list is not None
             profile = profile_list.get_default_video_stream_profile()
@@ -179,17 +245,21 @@ def read_camera(*, frame_queue, parameters_queue,  width, height, verbose=False)
     while True:
         # Wait for frames from the pipeline (with a timeout of 100 ms)
         frames = pipeline.wait_for_frames(100)
-        if frames is None:
+        if not frames:
             continue
 
-        # Get depth and color frames from the captured frames
-        depth_frame = frames.get_depth_frame()
+        # --- Spatial Alignment ---
+        # Transforms one stream to the coordinate system/FOV of the other
+        frames = align_filter.process(frames)
+        if not frames:
+            continue
+        
+        frames = frames.as_frame_set()
         color_frame = frames.get_color_frame()
-
-        # Skip iteration if depth or color frame is not available
-        if depth_frame is None or color_frame is None:
+        depth_frame = frames.get_depth_frame()
+        
+        if not color_frame or not depth_frame:
             continue
-
         if verbose: print("[STREAM] Read rgb frame of size", color_image.shape)
         if verbose: print("[STREAM] Read depth frame of size", depth_image.shape)
 
@@ -244,8 +314,8 @@ def inference(*, model, frame_queue, parameters_queue, send_queue, prompt_queue,
         image, depth = frame_queue.get()
         if not parameters_queue.empty(): 
             parameters = parameters_queue.get()
-            depth_intrinsics = pyorbbecsdk.OBCameraIntrinsic()
-            extrinsic = pyorbbecsdk.OBExtrinsic()
+            depth_intrinsics = OBCameraIntrinsic()
+            extrinsic = OBExtrinsic()
             depth_intrinsics.fx = parameters.fx
             depth_intrinsics.fy = parameters.fy
             depth_intrinsics.cx = parameters.cx
@@ -275,19 +345,18 @@ def inference(*, model, frame_queue, parameters_queue, send_queue, prompt_queue,
         ima = Image.fromarray(image[:, :, ::-1])
         ima.save(filename)
         prompt = prompt_queue.get()
-        print(prompt)
         # results = model.predict(image, stream=True, conf=min_confidence, show=False, verbose=False)
         response = chat(
             model='gemma4',
             messages=[
                 {
                     'role': 'system',
-                    'content': f'You are the vision system of a robotic arm. Your duty is to provide the pixel coordinates in format COORDINATES[x_pixel,y_pixel]. Remember: the picture size is {CROP_WIDTH}x{CROP_HEIGHT} the origin is top left corner, this will be used by the arm to pick an object.'
+                    'content': f'You are the vision system of a robotic arm. Answer only with the bounding box for the object referred by the user. Answer NONE if you cannot answer'
                 },
                 {
+                'images': [filename],
                 'role': 'user',
                 'content': prompt,
-                'images': [filename],
                 }
             ],
             think=False,
@@ -296,27 +365,54 @@ def inference(*, model, frame_queue, parameters_queue, send_queue, prompt_queue,
         sentence = response.message.content
         print(sentence)
         red = [0,0,255]
-        starter = sentence.find("COORDINATES[")
+        # starter = sentence.find("COORDINATES[")
+        starter = sentence.find("[")
         message = []
+        end_char = ","
+        comma = 0
         if starter != -1:
-            starter = starter + 12
-            comma = sentence[starter:].find(",")
-            ender = sentence[starter:].find("]")
-            if comma*ender > 0:
+            box = [0, 0, 0, 0]
+            try:
+                for i in range(4):
+                    if i == 3:
+                        end_char="]"
+                    comma = sentence[starter:].find(end_char)
+                    box[i] = int(sentence[starter:][1:comma])
+                    starter =starter + comma + 1
+            except:
+                match = re.search(r'```json\s+(.*?)\s+```', sentence, re.DOTALL)
+                if match:
+                    json_string = match.group(1)
+                    # Parse the string into a Python list/object
+                    data_list = json.loads(json_string)
+
+                    for item in data_list:
+                        try:
+                            box = item["box_2d"]
+                        except:
+                            print("Format Invalid")
+                        
+                else: 
+                    print("Format Invalid")
+
+            if min(box) > 0 and len(box) == 4:
                 try:
-                    y = int(sentence[starter:][:comma])
-                    x = int(sentence[starter:][comma+1:ender])
-                    message = parse(x,y, depth, depth_intrinsics, extrinsic, coeff_height, coeff_width)
-                    image2=image[:, :, ::-1]
-                    image2[x:x+20,y:y+20]=red                 
-                    Image.fromarray(image2).save(f"app/prova.jpg")
+                    # resize from gemma4 1000x1000 resolution
+                    box[0] = int(box[0] * (CROP_HEIGHT/1000))
+                    box[1] = int(box[1] * (CROP_WIDTH/1000))
+                    box[2] = int(box[2] * (CROP_HEIGHT/1000))
+                    box[3] = int(box[3] * (CROP_WIDTH/1000))
+                    image = np.ascontiguousarray(image, dtype=np.uint8)  # Ensure image is a valid NumPy array
+                    cv2.rectangle(image, (box[1], box[0]), (box[3], box[2]), red, 2)
+                    cv2.imwrite("app/prova.jpg", image)
+                    # image[box[0]:box[0]+20,box[1]:box[1]+20]=red
+                    # image[box[2]:box[2]+20,box[3]:box[3]+20]=red                   
+                    message = parse(box, depth, depth_intrinsics, extrinsic, coeff_height, coeff_width)
                 except Exception as e:
-                    print(e)
-            
-        # for i, r in enumerate(results):
-        #     r.save(filename=f"app/result.jpg")
+                    print(e)           
 
         if len(message) > 0:
+            print(message)
             send_queue.put(message)
         
         # if sleep > 0:
@@ -324,32 +420,74 @@ def inference(*, model, frame_queue, parameters_queue, send_queue, prompt_queue,
 
     cv2.destroyAllWindows()
 
-def parse(x,y,depth, depth_intrinsics, extrinsic, coeff_height, coeff_width):    
+def parse(box,depth, depth_intrinsics, extrinsic, coeff_height, coeff_width):    
     message = []
+    if len(box) != 4:
+        return message
+    
     cropper = ImageCropper(CROP_WIDTH, CROP_HEIGHT, CROP_STARTING_ROW, CROP_STARTING_COL)
-    y, x = cropper.cropped2orig(y, x)
-    target_x = x*coeff_width
-    target_y = y*coeff_height
+    box[0], box[1] = cropper.cropped2orig(box[0], box[1])
+    box[2], box[3] = cropper.cropped2orig(box[2],box[3])
+    print(box)
+    target_x_min = int(box[1]*coeff_width)
+    target_y_min = int(box[0]*coeff_height)
+    target_x_max = int(box[3]*coeff_width)
+    target_y_max = int(box[2]*coeff_height)
     target_z = 0
 
     try:
-        target_z = depth[int(target_y), int(target_x)].item()
+        x_array = range(target_x_min, target_x_max, 1) #width or col
+        y_array = range(target_y_min, target_y_max, 1) #height or row
+        X, Y = np.meshgrid(x_array, y_array)
+        
+        Z = depth[Y, X] # is a matrix so the order is Y,X (row,col) and not X,Y 
+        Z = np.where(Z > 480, Z, 650)  # Replace outliers with median
+        # Remove isolated spikes by applying a median filter
+        Z = cv2.medianBlur(Z, 5)  # Kernel size of 5
+
+        # Calculate the middle value between the median and the lowest point
+        Z_flat = Z.flatten()
+        Z_nonzero = Z_flat[Z_flat > 0]
+        if len(Z_nonzero) == 0:
+            print("No valid depth points found.")
+            return message
+        Z_min = np.min(Z_nonzero)
+        Z_median = np.median(Z_nonzero)
+        middle_value = (Z_min + Z_median) / 2
+
+        # Filter points lower than the middle value
+        mask = Z < middle_value
+        X_filtered = X[mask]
+        Y_filtered = Y[mask]
+        Z_filtered = Z[mask]
+
+        if len(Z_filtered) == 0:
+            print("No points below the middle value.")
+            return message
+
+        # Calculate the geometric centroid
+        centroid_x = float(np.mean(X_filtered))
+        centroid_y = float(np.mean(Y_filtered))
+        centroid_z = float(Z_min)
+        
+        final_target_z, final_target_x, final_target_y = transform_points(centroid_x, centroid_y, centroid_z, depth_intrinsics, extrinsic)
+        
+        message.append({
+            "X_centroid": final_target_x,
+            "Y_centroid": final_target_y,
+            "Z_centroid": final_target_z,
+        })
+
+        if False:
+            fig = plt.figure()
+            ax = plt.axes(projection='3d')
+            ax.scatter3D(X,Y,Z, c=Z, cmap='viridis')
+            # ax.scatter3D(X_filtered,Y_filtered,Z_filtered, c=Z_filtered, cmap='viridis')
+            plt.show()
 
     except Exception as e:
         print(e)
         return message
-    
-    if target_z == 0:
-        return message
-
-    target_z, target_x, target_y = transform_points(target_x, target_y, target_z, depth_intrinsics, extrinsic)
-
-    if target_z != 0: #check for possible occlusion on the depth image
-        message.append({
-            "X_target": target_x,
-            "Y_target": target_y,
-            "Z_target": target_z,
-        })
 
     return message
 
@@ -365,13 +503,13 @@ def main():
     parser.add_argument(
         "--width",
         type=int,
-        default=1920,
+        default=1280,
         help="Width of the input image"
     )
     parser.add_argument(
         "--height",
         type=int,
-        default=1080,
+        default=720,
         help="Height of the input image"
     )
     parser.add_argument(

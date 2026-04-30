@@ -191,7 +191,7 @@ def send(*, topic, topic_single, host, port, send_queue, username="", password="
             client.publish(topic_single, json.dumps(tomato))
             if verbose: print("[SEND] Sending event signle: ", tomato)
 
-def inference(*, model, frame_queue, parameters_queue, send_queue, min_confidence=0.45, verbose=False, sleep=0):
+def inference(*, model, frame_queue, parameters_queue, send_queue, min_confidence=0.45, verbose=True, sleep=0):
     model = YOLO(model)
     print("[INFERENCE] Loaded model")
     
@@ -224,15 +224,19 @@ def inference(*, model, frame_queue, parameters_queue, send_queue, min_confidenc
         cropper = ImageCropper(CROP_WIDTH, CROP_HEIGHT, CROP_STARTING_ROW, CROP_STARTING_COL)
         image = cropper.crop(image)
 
-        results = model.predict(image, stream=True, conf=min_confidence, show=True, verbose=False)
+        results = model.predict(image, stream=True, conf=min_confidence, show=False, verbose=False)
         
-        message = parse(results, depth, depth_intrinsics, extrinsic, coeff_height, coeff_width)
+        for i, r in enumerate(results):
+            # Save results to disk
+            r.save(filename=f"app/result.jpg")
 
-        if len(message) > 0:
-            send_queue.put(message)
+        # message = parse(results, depth, depth_intrinsics, extrinsic, coeff_height, coeff_width)
+
+        # if len(message) > 0:
+        #     send_queue.put(message)
         
-        if sleep > 0:
-            time.sleep(sleep)
+        # if sleep > 0:
+        #     time.sleep(sleep)
 
     cv2.destroyAllWindows()
 
@@ -304,7 +308,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="app/best.pt",
+        default="app/yolov8x-oiv7.pt",
         help="Path to the YOLOv11 model"
     )
     parser.add_argument(
@@ -322,7 +326,7 @@ def main():
     parser.add_argument(
         "--mqtt-host",
         type=str,
-        default="192.168.1.21",
+        default="192.168.139.122",
         help="Host of the MQTT broker"
     )
     parser.add_argument(

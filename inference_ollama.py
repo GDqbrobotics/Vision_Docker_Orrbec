@@ -6,7 +6,6 @@ import re, json
 import paho.mqtt.client as mqtt
 from multiprocessing import Process, Queue
 from PIL import Image
-from PIL import ImageOps
 from pyorbbecsdk import *
 from ollama import chat 
 import sounddevice as sd
@@ -14,6 +13,7 @@ from scipy.io.wavfile import write
 import matplotlib.pyplot as plt
 from mpl_toolkits import mplot3d
 from typing import Union, Any, Optional
+from faster_whisper import WhisperModel
 
 _initialized = False
 
@@ -69,7 +69,7 @@ def record_audio(prompt_queue):
     
     device_list=sd.query_devices()
     print(device_list)
-    device_ID = 0
+
     for device in device_list:
         if device["name"].find("Device: Audio") > -1:
             print("Microphone found.")
@@ -77,6 +77,8 @@ def record_audio(prompt_queue):
             break
     
     print(f"Microphone ID:  {sd.default.device}")
+
+    whisper_model = WhisperModel("tiny.en",device="cpu", compute_type="int8")
 
     while True:
         pre_recording = sd.rec(int(0.5 * freq), samplerate=freq, channels=1)
@@ -96,28 +98,18 @@ def record_audio(prompt_queue):
         
         # This will convert the NumPy array to an audio
         # file with the given sampling frequency
-        write("app/recording0.wav", freq, recording)
+        write("/app/recording0.wav", freq, recording)
 
-        response = chat(
-            model='gemma4',
-            messages=[
-                {
-                    'role': 'system',
-                    'content': f'You are a trascription system. You are able to transcript only English or Italian.'
-                },
-                {
-                'images': ["app/recording0.wav"],
-                'role': 'user',
-                'content': 'Answer only with the audio trascription',
-                }
-            ],
-            think=False,
-            stream=False,
-        )
-        sentence = response.message.content
+        segments,info = whisper_model.transcribe("/app/recording0.wav")
+        sentence = ""
+        for segment in segments:
+            sentence += segment.text
+        
         print(sentence)
-        if len(sentence) > 10:
+        if len(sentence) > 12:
             prompt_queue.put(sentence)
+            time.sleep(3) # avoid multiple recordings in a row
+
 
 
 class TemporalFilter:
@@ -341,11 +333,11 @@ def inference(*, model, frame_queue, parameters_queue, send_queue, prompt_queue,
         cropper = ImageCropper(CROP_WIDTH, CROP_HEIGHT, CROP_STARTING_ROW, CROP_STARTING_COL)
         image = cropper.crop(image)
         
-        filename=f"app/result.jpg"
+        filename=f"/app/result.jpg"
         ima = Image.fromarray(image[:, :, ::-1])
         ima.save(filename)
         prompt = prompt_queue.get()
-        # results = model.predict(image, stream=True, conf=min_confidence, show=False, verbose=False)
+
         response = chat(
             model='gemma4',
             messages=[
@@ -365,7 +357,7 @@ def inference(*, model, frame_queue, parameters_queue, send_queue, prompt_queue,
         sentence = response.message.content
         print(sentence)
         red = [0,0,255]
-        # starter = sentence.find("COORDINATES[")
+
         starter = sentence.find("[")
         message = []
         end_char = ","
@@ -404,21 +396,17 @@ def inference(*, model, frame_queue, parameters_queue, send_queue, prompt_queue,
                     box[3] = int(box[3] * (CROP_WIDTH/1000))
                     image = np.ascontiguousarray(image, dtype=np.uint8)  # Ensure image is a valid NumPy array
                     cv2.rectangle(image, (box[1], box[0]), (box[3], box[2]), red, 2)
-                    cv2.imwrite("app/prova.jpg", image)
-                    # image[box[0]:box[0]+20,box[1]:box[1]+20]=red
-                    # image[box[2]:box[2]+20,box[3]:box[3]+20]=red                   
+                    cv2.imwrite("/app/prova.jpg", image)
+            
                     message = parse(box, depth, depth_intrinsics, extrinsic, coeff_height, coeff_width)
+
                 except Exception as e:
                     print(e)           
 
         if len(message) > 0:
             print(message)
             send_queue.put(message)
-        
-        # if sleep > 0:
-        #     time.sleep(sleep)
 
-    cv2.destroyAllWindows()
 
 def parse(box,depth, depth_intrinsics, extrinsic, coeff_height, coeff_width):    
     message = []
@@ -443,7 +431,9 @@ def parse(box,depth, depth_intrinsics, extrinsic, coeff_height, coeff_width):
         Z = depth[Y, X] # is a matrix so the order is Y,X (row,col) and not X,Y 
         Z = np.where(Z > 480, Z, 650)  # Replace outliers with median
         # Remove isolated spikes by applying a median filter
-        Z = cv2.medianBlur(Z, 5)  # Kernel size of 5
+        Z = cv2.medianBlur(Z, 7)  # Kernel size of 7
+        Z = cv2.medianBlur(Z, 7)
+        Z = cv2.medianBlur(Z, 7)
 
         # Calculate the middle value between the median and the lowest point
         Z_flat = Z.flatten()
@@ -497,7 +487,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="app/yolov8x-oiv7.pt",
+        default="/app/yolov8x-oiv7.pt",
         help="Path to the YOLOv11 model"
     )
     parser.add_argument(

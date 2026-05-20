@@ -11,14 +11,15 @@ from ultralytics import YOLO
 from typing import Union, Any, Optional
 from pyorbbecsdk import *
 import matplotlib.pyplot as plt
+import math
 
 _initialized = False
 
 MIN_DEPTH = 20  # 20mm
 MAX_DEPTH = 10000  # 10000mm
 
-CROP_WIDTH = 900
-CROP_HEIGHT = 900
+CROP_WIDTH = 1400
+CROP_HEIGHT = 1080
 CROP_STARTING_ROW = int((1080 - int(CROP_HEIGHT))/2)
 CROP_STARTING_COL = int((1920 - int(CROP_WIDTH))/2)
 
@@ -274,14 +275,15 @@ def inference(*, model, frame_queue, parameters_queue, send_queue, min_confidenc
         
         closure_factor, box, wrist, knuckle_ref = process_hand_results(results)
         message = parse_box(box, depth, depth_intrinsics, extrinsic, coeff_height, coeff_width)
-        
         if len(message) > 0:
+            orientation = wrist - knuckle_ref
             message[0]["closure_factor"] = closure_factor
+            message[0]["yaw"] = math.atan2(orientation[1], orientation[0])  # radians
             send_queue.put(message)
-            print("[INFERENCE] Sent message: ", message)
+            # print("[INFERENCE] Sent message: ", message)
         
-        # if sleep > 0:
-        #     time.sleep(sleep)
+        if sleep > 0:
+            time.sleep(sleep)
 
     cv2.destroyAllWindows()
 
@@ -359,9 +361,9 @@ def parse(wrist, knuckle_ref, depth, depth_intrinsics, extrinsic, coeff_height, 
     knuckle_z, knuckle_x, knuckle_y = transform_points(knuckle_ref[0], knuckle_ref[1], knuckle_ref_depth, depth_intrinsics, extrinsic)
     wrist_z, wrist_x, wrist_y = transform_points(wrist[0], wrist[1], wrist_depth, depth_intrinsics, extrinsic)
     message.append({
-        "X_centroid": wrist_x,
-        "Y_centroid": wrist_y,
-        "Z_centroid": wrist_z,
+        "X_centroid": (wrist_x+knuckle_x)/2,
+        "Y_centroid": (wrist_y+knuckle_y)/2,
+        "Z_centroid": (wrist_z+knuckle_z)/2,
         "orientation": {
             "wrist_to_knuckle_x": wrist_x - knuckle_x,
             "wrist_to_knuckle_y": wrist_y - knuckle_y,
@@ -378,7 +380,7 @@ def parse_box(box,depth, depth_intrinsics, extrinsic, coeff_height, coeff_width)
     cropper = ImageCropper(CROP_WIDTH, CROP_HEIGHT, CROP_STARTING_ROW, CROP_STARTING_COL)
     box[1], box[0] = cropper.cropped2orig(box[1], box[0])
     box[3], box[2] = cropper.cropped2orig(box[3],box[2])
-    print(box)
+    # print(box)
     target_x_min = int(box[0]*coeff_width)
     target_y_min = int(box[1]*coeff_height)
     target_x_max = int(box[2]*coeff_width)
@@ -468,7 +470,7 @@ def main():
     parser.add_argument(
         "--mqtt-host",
         type=str,
-        default="192.168.139.122",
+        default="192.168.139.80",
         help="Host of the MQTT broker"
     )
     parser.add_argument(
@@ -504,7 +506,7 @@ def main():
     parser.add_argument(
         "--inference-sleep",
         type=float,
-        default=0.01,
+        default=0.2,
         help="Sleep time between inferences"
     )
     parser.add_argument(

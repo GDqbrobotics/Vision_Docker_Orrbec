@@ -266,7 +266,7 @@ def inference(*, model, frame_queue, parameters_queue, send_queue, min_confidenc
         image = cropper.crop(image)
 
         results = list(model.predict(image, stream=True, conf=min_confidence, show=False, verbose=False))
-        
+        max_confidence = 0
         for i, r in enumerate(results):
             # Save results to disk
             r.save(filename=f"result.jpg")
@@ -452,7 +452,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="hand_pose2.pt",
+        default="hand_prova.pt",
         help="Path to the YOLOv11 model"
     )
     parser.add_argument(
@@ -470,7 +470,7 @@ def main():
     parser.add_argument(
         "--mqtt-host",
         type=str,
-        default="192.168.139.80",
+        default="192.168.5.11",
         help="Host of the MQTT broker"
     )
     parser.add_argument(
@@ -506,7 +506,7 @@ def main():
     parser.add_argument(
         "--inference-sleep",
         type=float,
-        default=0.2,
+        default=0.35,
         help="Sleep time between inferences"
     )
     parser.add_argument(
@@ -517,7 +517,7 @@ def main():
     parser.add_argument(
         "--min-confidence",
         type=float,
-        default=0.3,
+        default=0.2,
         help="Confidence threshold for object detection"
     )
 

@@ -452,7 +452,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="hand_prova.pt",
+        default="hand_pose3.pt",
         help="Path to the YOLOv11 model"
     )
     parser.add_argument(
@@ -506,7 +506,7 @@ def main():
     parser.add_argument(
         "--inference-sleep",
         type=float,
-        default=0.35,
+        default=0.2,
         help="Sleep time between inferences"
     )
     parser.add_argument(
